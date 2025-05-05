@@ -6,14 +6,22 @@ metadata:
 spec:
   template:
     spec:
+      volumes:
+      - name: model-weights
+        persistentVolumeClaim:
+          claimName: eric-pvc
       containers:
       - name: iree-benchmark-suite
         image: efric/iree-benchmark-test
         command: ["/bin/bash", "-c"]
+        volumeMounts:
+        - name: model-weights
+          mountPath: /data/shark
         args:
           - |
-            set -e
+            set -eux
             readonly IREE_DIR="/iree"
+            readonly BENCHMARK_DIR="/iree-model-benchmark"
             readonly BUILD_DIR="/iree-build"
       
             mkdir -p "$BUILD_DIR"
@@ -44,9 +52,27 @@ spec:
                   -DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
                   -DCMAKE_INSTALL_PREFIX=run
       
-            echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR"
-            cmake --build /iree-build -j$(nproc)
-            echo "[INFO] IREE successfully built in $BUILD_DIR"
+            echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR."
+            cmake --build "$BUILD_DIR" -j"$(nproc)"
+            echo "[INFO] IREE successfully built in $BUILD_DIR."
+
+            if [ ! -f /data/shark/punet_fp8_weights.irpa ]; then
+              echo "[INFO] Model weights not found. Downloading IRPA file..."
+              curl -L -o /data/shark/punet_fp8_weights.irpa \
+                https://sharkpublic.blob.core.windows.net/sharkpublic/sdxl-scripts-weights/punet_fp8_weights.irpa
+              echo "42df7496dc012548e5fc1a198cb1161d  /data/shark/punet_fp8_weights.irpa" | md5sum -c || {
+                echo "[ERROR] IRPA checksum verification failed" >&2
+                exit 1
+              }
+            fi
+
+            #Usage: PATH=/path/to/iree/build/tools:$PATH ./compile-unet.sh <target-chip> [extra flags]
+            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/compile-punet.sh gfx942 none 4
+            #Usage: PATH=/path/to/iree/build/tools:$PATH ./benchmark-unet.sh <hip-device-id> <batch-size> [<ipra-path-prefix>]
+
+            echo "[INFO] Running IREE model benchmarks"
+            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/benchmark-unet.sh 0 4
+            echo "[INFO] sdxl fp8 modle benchmark completed."
         resources:
           limits:
             amd.com/gpu: 1
