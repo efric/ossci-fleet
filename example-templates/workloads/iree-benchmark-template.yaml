@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ericfeng-iree-benchmark-test-job
+  name: iree-benchmark-job
 
 spec:
   template:
     spec:
       volumes:
-      - name: model-weights
+      - name: iree-benchmark-vol
         persistentVolumeClaim:
           claimName: eric-pvc
       containers:
@@ -15,47 +15,96 @@ spec:
         image: efric/iree-benchmark-test
         command: ["/bin/bash", "-c"]
         volumeMounts:
-        - name: model-weights
-          mountPath: /data/shark
+        - name: iree-benchmark-vol
+          mountPath: /data/shark # for IRPA weights
+        - name: iree-benchmark-vol
+          mountPath: /iree-cache # for build cache & signatures
+        env:
+        # Change values for custom build flags
+        - name: IREE_CMAKE_FLAGS
+          value: >
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DIREE_BUILD_PYTHON_BINDINGS=1
+            -DIREE_HAL_DRIVER_HIP=1
+            -DIREE_TARGET_BACKEND_ROCM=1
+            -DIREE_HIP_TEST_TARGET_CHIP=gfx942
+            -DIREE_ENABLE_ASSERTIONS=1
+            -DIREE_BUILD_TRACY=0
+            -DIREE_ENABLE_COMPILER_TRACING=0
+            -DIREE_ENABLE_RUNTIME_TRACING=1
+            -DIREE_ENABLE_LLD=1
+            -DIREE_ENABLE_SPLIT_DWARF=1
+            -DIREE_ENABLE_THIN_ARCHIVES=1
+            -DLLVM_INSTALL_UTILS=1
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=1
+        - name: IREE_GIT_BRANCH
+          value: "main"
         args:
           - |
-            set -eux
+            set -eu
             readonly IREE_DIR="/iree"
             readonly BENCHMARK_DIR="/iree-model-benchmark"
-            readonly BUILD_DIR="/iree-build"
-      
-            mkdir -p "$BUILD_DIR"
-            cd "$BUILD_DIR"
-      
+            readonly CACHE_ROOT="/iree-cache"
+            readonly MAX_AGE_DAYS=14
+
+            cd "$IREE_DIR"
+            git checkout "$IREE_GIT_BRANCH"
+            git pull origin "$IREE_GIT_BRANCH"
+            git submodule update --init --recursive
+
+            readonly HEAD_COMMIT=$(git rev-parse HEAD)
+            readonly CONFIG_HASH=$(echo -n "$HEAD_COMMIT|${IREE_CMAKE_FLAGS//$'\n'/ }" | md5sum | awk '{print $1}')
+
+            readonly BUILD_DIR="${CACHE_ROOT}/build-${CONFIG_HASH}"
+            readonly INSTALL_DIR="${CACHE_ROOT}/install-${CONFIG_HASH}"
+            readonly SIG_FILE="${CACHE_ROOT}/.signature-${CONFIG_HASH}"
+            readonly TMP_SIG="/tmp/current.signature"
+
+            mkdir -p "$CACHE_ROOT"
+
+            # Auto-clean cache older than MAX_AGE_DAYS
+            if [[ -f "$SIG_FILE" ]]; then
+              last_mod=$(stat -c %Y "$SIG_FILE")
+              now=$(date +%s)
+              age_days=$(( (now - last_mod) / 86400 ))
+              if (( age_days > MAX_AGE_DAYS )); then
+                echo "[INFO] Cache is $age_days days old; cleaning $BUILD_DIR and $INSTALL_DIR"
+                rm -rf "${BUILD_DIR}" "${INSTALL_DIR}" "${SIG_FILE}"
+              fi
+            fi
+   
+            echo "$HEAD_COMMIT" > "$TMP_SIG"
+
             readonly COMMON_FLAGS="-fno-omit-frame-pointer"
             readonly CXX="clang++"
             readonly CC="clang"
-      
-            cmake "$IREE_DIR" -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-                  -DPython3_EXECUTABLE="$(which python)" \
-                  -DIREE_BUILD_PYTHON_BINDINGS=1 \
-                  -DIREE_HAL_DRIVER_HIP=1 \
-                  -DIREE_TARGET_BACKEND_ROCM=1 \
-                  -DIREE_HIP_TEST_TARGET_CHIP=gfx942 \
-                  -DIREE_ENABLE_ASSERTIONS=1 \
-                  -DIREE_BUILD_TRACY=0 \
-                  -DIREE_ENABLE_COMPILER_TRACING=0 \
-                  -DIREE_ENABLE_RUNTIME_TRACING=1 \
-                  -DIREE_ENABLE_LLD=1 \
-                  -DIREE_ENABLE_SPLIT_DWARF=1 \
-                  -DIREE_ENABLE_THIN_ARCHIVES=1 \
-                  -DLLVM_INSTALL_UTILS=1 \
-                  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-                  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-                  -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_C_COMPILER="$CC" \
-                  -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
-                  -DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
-                  -DCMAKE_INSTALL_PREFIX=run
-      
-            echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR."
-            cmake --build "$BUILD_DIR" -j"$(nproc)"
-            echo "[INFO] IREE successfully built in $BUILD_DIR."
+   
+            # Rebuild if needed
+            if ! cmp -s "$TMP_SIG" "$SIG_FILE"; then
+              echo "[INFO] Rebuilding IREE for commit $HEAD_COMMIT"
+              rm -rf "${BUILD_DIR}" "${INSTALL_DIR}"
+              mkdir -p "$BUILD_DIR"
+              cmake "$IREE_DIR" -B "$BUILD_DIR" -GNinja \
+                $IREE_CMAKE_FLAGS \
+                -DPython3_EXECUTABLE="$(which python)" \
+                -DCMAKE_CXX_COMPILER="$CXX" \
+                -DCMAKE_C_COMPILER="$CC" \
+                -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
+                -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
+                -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR"
 
+              echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR."
+              cmake --build "$BUILD_DIR" -j"$(nproc)"
+              echo "[INFO] IREE successfully built in $BUILD_DIR."
+              cmake --install "$BUILD_DIR"
+              echo "[INFO] IREE installed on system."
+              cp "$TMP_SIG" "$SIG_FILE"
+            else
+              echo "[INFO] Reusing cached build at $INSTALL_DIR"
+            fi
+   
+            export PATH="$INSTALL_DIR/bin:$PATH"
+   
             if [ ! -f /data/shark/punet_fp8_weights.irpa ]; then
               echo "[INFO] Model weights not found. Downloading IRPA file..."
               curl -L -o /data/shark/punet_fp8_weights.irpa \
@@ -68,10 +117,11 @@ spec:
 
             #Usage: PATH=/path/to/iree/build/tools:$PATH ./compile-unet.sh <target-chip> [extra flags]
             PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/compile-punet.sh gfx942 none 4
-            #Usage: PATH=/path/to/iree/build/tools:$PATH ./benchmark-unet.sh <hip-device-id> <batch-size> [<ipra-path-prefix>]
 
             echo "[INFO] Running IREE model benchmarks"
+            #Usage: PATH=/path/to/iree/build/tools:$PATH ./benchmark-unet.sh <hip-device-id> <batch-size> [<ipra-path-prefix>]
             PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/benchmark-unet.sh 0 4
+
             echo "[INFO] sdxl fp8 modle benchmark completed."
         resources:
           limits:
