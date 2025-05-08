@@ -38,18 +38,30 @@ spec:
             -DLLVM_INSTALL_UTILS=1
             -DCMAKE_EXPORT_COMPILE_COMMANDS=1
         - name: IREE_GIT_BRANCH
-          value: "main"
+          value: "tags/v3.4.0" # for testing purposes
+        - name: BENCHMARK_OUT
+          value: "results.json"
+        - name: BENCHMARK_OUT_FORMAT
+          value: "json"
+        - name: HIP_TARGET_CHIP
+          value: "gfx942"
+        - name: TUNING_CHIP_CONFIG_MODE
+          value: "none"
+        - name: BATCH_SIZE
+          value: "4"
+        - name: HIP_DEVICE_ID
+          value: "0"
         args:
           - |
             set -eu
             readonly IREE_DIR="/iree"
             readonly BENCHMARK_DIR="/iree-model-benchmark"
             readonly CACHE_ROOT="/iree-cache"
-            readonly MAX_AGE_DAYS=14
 
             cd "$IREE_DIR"
+            git fetch --all --tags
             git checkout "$IREE_GIT_BRANCH"
-            git pull origin "$IREE_GIT_BRANCH"
+            #git pull origin "$IREE_GIT_BRANCH"
             git submodule update --init --recursive
 
             readonly HEAD_COMMIT=$(git rev-parse HEAD)
@@ -62,17 +74,6 @@ spec:
 
             mkdir -p "$CACHE_ROOT"
 
-            # Auto-clean cache older than MAX_AGE_DAYS
-            if [[ -f "$SIG_FILE" ]]; then
-              last_mod=$(stat -c %Y "$SIG_FILE")
-              now=$(date +%s)
-              age_days=$(( (now - last_mod) / 86400 ))
-              if (( age_days > MAX_AGE_DAYS )); then
-                echo "[INFO] Cache is $age_days days old; cleaning $BUILD_DIR and $INSTALL_DIR"
-                rm -rf "${BUILD_DIR}" "${INSTALL_DIR}" "${SIG_FILE}"
-              fi
-            fi
-   
             echo "$HEAD_COMMIT" > "$TMP_SIG"
 
             readonly COMMON_FLAGS="-fno-omit-frame-pointer"
@@ -93,17 +94,17 @@ spec:
                 -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
                 -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR"
 
-              echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR."
+              #echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR"
               cmake --build "$BUILD_DIR" -j"$(nproc)"
-              echo "[INFO] IREE successfully built in $BUILD_DIR."
-              cmake --install "$BUILD_DIR"
-              echo "[INFO] IREE installed on system."
+              #echo "[INFO] IREE successfully built in $BUILD_DIR"
+              #cmake --install "$BUILD_DIR"
+              #echo "[INFO] IREE installed on system."
               cp "$TMP_SIG" "$SIG_FILE"
             else
               echo "[INFO] Reusing cached build at $INSTALL_DIR"
             fi
    
-            export PATH="$INSTALL_DIR/bin:$PATH"
+            #export PATH="$INSTALL_DIR/bin:$PATH"
    
             if [ ! -f /data/shark/punet_fp8_weights.irpa ]; then
               echo "[INFO] Model weights not found. Downloading IRPA file..."
@@ -115,14 +116,12 @@ spec:
               }
             fi
 
-            #Usage: PATH=/path/to/iree/build/tools:$PATH ./compile-unet.sh <target-chip> [extra flags]
-            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/compile-punet.sh gfx942 none 4
+            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/compile-punet.sh "$HIP_TARGET_CHIP" "$TUNING_CHIP_CONFIG_MODE" "$BATCH_SIZE"
 
             echo "[INFO] Running IREE model benchmarks"
-            #Usage: PATH=/path/to/iree/build/tools:$PATH ./benchmark-unet.sh <hip-device-id> <batch-size> [<ipra-path-prefix>]
-            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/benchmark-unet.sh 0 4
+            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/benchmark-unet.sh "$HIP_DEVICE_ID" "$BATCH_SIZE"
 
-            echo "[INFO] sdxl fp8 modle benchmark completed."
+            echo "[INFO] sdxl fp8 model benchmark completed."
         resources:
           limits:
             amd.com/gpu: 1
