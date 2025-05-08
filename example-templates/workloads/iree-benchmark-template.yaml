@@ -40,7 +40,7 @@ spec:
         - name: IREE_GIT_BRANCH
           value: "tags/v3.4.0" # for testing purposes
         - name: BENCHMARK_OUT
-          value: "results.json"
+          value: "/iree-model-benchmark/sdxl/fp8-model/results.json"
         - name: BENCHMARK_OUT_FORMAT
           value: "json"
         - name: HIP_TARGET_CHIP
@@ -51,6 +51,21 @@ spec:
           value: "4"
         - name: HIP_DEVICE_ID
           value: "0"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: oci-s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: oci-s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AWS_SESSION_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: oci-s3-credentials
+              key: AWS_SESSION_TOKEN
         args:
           - |
             set -eu
@@ -83,7 +98,7 @@ spec:
             # Rebuild if needed
             if ! cmp -s "$TMP_SIG" "$SIG_FILE"; then
               echo "[INFO] Rebuilding IREE for commit $HEAD_COMMIT"
-              rm -rf "${BUILD_DIR}" "${INSTALL_DIR}"
+              rm -rf "$BUILD_DIR" "$INSTALL_DIR"
               mkdir -p "$BUILD_DIR"
               cmake "$IREE_DIR" -B "$BUILD_DIR" -GNinja \
                 $IREE_CMAKE_FLAGS \
@@ -122,6 +137,8 @@ spec:
             PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/benchmark-unet.sh "$HIP_DEVICE_ID" "$BATCH_SIZE"
 
             echo "[INFO] sdxl fp8 model benchmark completed."
+            aws s3 cp "$BENCHMARK_OUT" s3://eric-shark-test/results.json
+            echo "To download results: aws s3 cp s3://eric-shark-test/results.json /local/path/to/results/"
         resources:
           limits:
             amd.com/gpu: 1
