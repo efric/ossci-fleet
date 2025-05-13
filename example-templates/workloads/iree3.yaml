@@ -2,7 +2,6 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: iree-benchmark-job
-
 spec:
   template:
     spec:
@@ -12,7 +11,7 @@ spec:
           claimName: eric-pvc
       containers:
       - name: iree-benchmark-suite
-        image: efric/iree-benchmark-test
+        image: efric/iree-benchmark-test #ghcr.io/efric/iree-benchmark-test:latest
         command: ["/bin/bash", "-c"]
         volumeMounts:
         - name: iree-benchmark-vol
@@ -20,7 +19,6 @@ spec:
         - name: iree-benchmark-vol
           mountPath: /iree-cache # for build cache & signatures
         env:
-        # Change values for custom build flags
         - name: IREE_CMAKE_FLAGS
           value: >
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -38,11 +36,21 @@ spec:
             -DLLVM_INSTALL_UTILS=1
             -DCMAKE_EXPORT_COMPILE_COMMANDS=1
         - name: IREE_GIT_BRANCH
-          value: "tags/v3.4.0" # switch out for desired branch
-        - name: BENCHMARK_OUT
-          value: "/iree-model-benchmark/sdxl/fp8-model/results.json"
+          value: "main" # switch out for desired branch
         - name: BENCHMARK_OUT_FORMAT
           value: "json"
+        - name: BENCHMARK_DIR
+          value: "/iree-model-benchmark"
+        - name: BENCHMARK_PATH
+          value: "sdxl/fp16-model" # relative path under BENCHMARK_DIR
+        - name: COMPILE_SCRIPT
+          value: "compile-unet.sh"
+        - name: BENCHMARK_SCRIPT
+          value: "benchmark-unet.sh"
+        - name: IRPA_URL
+          value: "https://sharkpublic.blob.core.windows.net/sharkpublic/sdxl-scripts-weights/scheduled_unet_fp16.irpa" #"https://sharkpublic.blob.core.windows.net/sharkpublic/sdxl-scripts-weights/punet_fp8_weights.irpa"
+        - name: RESULT_PREFIX
+          value: "results"
         - name: HIP_TARGET_CHIP
           value: "gfx942"
         - name: TUNING_CHIP_CONFIG_MODE
@@ -70,17 +78,15 @@ spec:
           - |
             set -eu
             readonly IREE_DIR="/iree"
-            readonly BENCHMARK_DIR="/iree-model-benchmark"
             readonly CACHE_ROOT="/iree-cache"
 
             cd "$BENCHMARK_DIR"
             git pull origin main
 
             cd "$IREE_DIR"
-            git fetch --all --tags
+            git fetch origin --tags
             git checkout "$IREE_GIT_BRANCH"
-            #git pull origin "$IREE_GIT_BRANCH"
-            git submodule update --init --recursive
+            git pull --recurse-submodules origin "$IREE_GIT_BRANCH"
 
             readonly HEAD_COMMIT=$(git rev-parse HEAD)
             readonly CONFIG_HASH=$(echo -n "$HEAD_COMMIT|${IREE_CMAKE_FLAGS//$'\n'/ }" | md5sum | awk '{print $1}')
@@ -91,13 +97,12 @@ spec:
             readonly TMP_SIG="/tmp/current.signature"
 
             mkdir -p "$CACHE_ROOT"
-
             echo "$HEAD_COMMIT" > "$TMP_SIG"
 
             readonly COMMON_FLAGS="-fno-omit-frame-pointer"
             readonly CXX="clang++"
             readonly CC="clang"
-   
+
             # Rebuild if needed
             if ! cmp -s "$TMP_SIG" "$SIG_FILE"; then
               echo "[INFO] Rebuilding IREE for commit $HEAD_COMMIT"
@@ -111,40 +116,32 @@ spec:
                 -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
                 -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
                 -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR"
-
-              #echo "[INFO] IREE CMake successfully configured build system in $BUILD_DIR"
               cmake --build "$BUILD_DIR" -j"$(nproc)"
-              #echo "[INFO] IREE successfully built in $BUILD_DIR"
-              #cmake --install "$BUILD_DIR"
-              #echo "[INFO] IREE installed on system."
               cp "$TMP_SIG" "$SIG_FILE"
             else
               echo "[INFO] Reusing cached build at $INSTALL_DIR"
             fi
-   
-            #export PATH="$INSTALL_DIR/bin:$PATH"
-   
-            if [ ! -f /data/shark/punet_fp8_weights.irpa ]; then
-              echo "[INFO] Model weights not found. Downloading IRPA file..."
-              curl -L -o /data/shark/punet_fp8_weights.irpa \
-                https://sharkpublic.blob.core.windows.net/sharkpublic/sdxl-scripts-weights/punet_fp8_weights.irpa
-              echo "42df7496dc012548e5fc1a198cb1161d  /data/shark/punet_fp8_weights.irpa" | md5sum -c || {
-                echo "[ERROR] IRPA checksum verification failed" >&2
-                exit 1
-              }
+
+            # Download IRPA model if missing
+            IRPA_DEST="/data/shark/$(basename "$IRPA_URL")"
+            if [ ! -f "$IRPA_DEST" ]; then
+              echo "[INFO] Downloading IRPA weights from $IRPA_URL"
+              curl -L -o "$IRPA_DEST" "$IRPA_URL"
             fi
 
-            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/compile-punet.sh "$HIP_TARGET_CHIP" "$TUNING_CHIP_CONFIG_MODE" "$BATCH_SIZE"
+            BENCH_NAME="$(basename "$BENCHMARK_PATH")"
+            RESULT_FILE="$BENCHMARK_DIR/$BENCHMARK_PATH/${RESULT_PREFIX}-${BENCH_NAME}-${CONFIG_HASH}.json"
 
-            echo "[INFO] Running IREE model benchmarks"
-            PATH="$BUILD_DIR"/tools:$PATH "$BENCHMARK_DIR"/sdxl/fp8-model/benchmark-unet.sh "$HIP_DEVICE_ID" "$BATCH_SIZE"
+            mkdir -p "$IREE_DIR"/tmp/
+            echo "[INFO] Running compile and benchmark for $BENCH_NAME"
+            PATH="$BUILD_DIR/tools:$PATH" "$BENCHMARK_DIR/$BENCHMARK_PATH/$COMPILE_SCRIPT" "$HIP_TARGET_CHIP" #"$TUNING_CHIP_CONFIG_MODE" "$BATCH_SIZE"
+            PATH="$BUILD_DIR/tools:$PATH" "$BENCHMARK_DIR/$BENCHMARK_PATH/$BENCHMARK_SCRIPT" "$HIP_DEVICE_ID" > "$RESULT_FILE"
 
-            echo "[INFO] sdxl fp8 model benchmark completed."
-            aws s3 cp "$BENCHMARK_OUT" s3://eric-shark-test/results.json
-            echo "To download results: aws s3 cp s3://eric-shark-test/results.json /local/path/to/results/"
+            echo "[INFO] Benchmark completed. Uploading results to S3"
+            aws s3 cp "$RESULT_FILE" "s3://eric-shark-test/$(basename "$RESULT_FILE")"
+            echo "[COMPLETED] Download results: aws s3 cp s3://eric-shark-test/$(basename "$RESULT_FILE") /local/path/to/results/"
         resources:
           limits:
             amd.com/gpu: 1
       restartPolicy: Never
   backoffLimit: 0
-
