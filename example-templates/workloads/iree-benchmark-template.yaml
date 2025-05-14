@@ -84,9 +84,8 @@ spec:
             git pull origin main
 
             cd "$IREE_DIR"
-            git fetch origin --tags
+            git pull origin main
             git checkout "$IREE_GIT_BRANCH"
-            git pull --recurse-submodules origin "$IREE_GIT_BRANCH"
 
             readonly HEAD_COMMIT=$(git rev-parse HEAD)
             readonly CONFIG_HASH=$(echo -n "$HEAD_COMMIT|${IREE_CMAKE_FLAGS//$'\n'/ }" | md5sum | awk '{print $1}')
