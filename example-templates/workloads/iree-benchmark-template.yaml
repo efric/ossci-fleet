@@ -21,13 +21,13 @@ spec:
         env:
         - name: IREE_CMAKE_FLAGS
           value: >
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DCMAKE_BUILD_TYPE=Release
             -DIREE_BUILD_PYTHON_BINDINGS=1
             -DIREE_HAL_DRIVER_HIP=1
             -DIREE_TARGET_BACKEND_ROCM=1
             -DIREE_HIP_TEST_TARGET_CHIP=gfx942
             -DIREE_ENABLE_ASSERTIONS=1
-            -DIREE_BUILD_TRACY=0
+            -DIREE_BUILD_TRACY=1
             -DIREE_ENABLE_COMPILER_TRACING=0
             -DIREE_ENABLE_RUNTIME_TRACING=1
             -DIREE_ENABLE_LLD=1
@@ -86,6 +86,8 @@ spec:
             cd "$IREE_DIR"
             git pull origin main
             git checkout "$IREE_GIT_BRANCH"
+            git submodule sync
+            git submodule update --init --recursive
 
             readonly HEAD_COMMIT=$(git rev-parse HEAD)
             readonly CONFIG_HASH=$(echo -n "$HEAD_COMMIT|${IREE_CMAKE_FLAGS//$'\n'/ }" | md5sum | awk '{print $1}')
@@ -129,17 +131,28 @@ spec:
             fi
 
             BENCH_NAME="$(basename "$BENCHMARK_PATH")"
-            RESULT_FILE="$BENCHMARK_DIR/$BENCHMARK_PATH/${RESULT_PREFIX}-${BENCH_NAME}-${CONFIG_HASH}.json"
-            export BENCHMARK_OUT="$RESULT_FILE"
+            RESULT_PREFIX="$BENCHMARK_DIR/$BENCHMARK_PATH/${RESULT_PREFIX}-${BENCH_NAME}-${CONFIG_HASH}"
+            TRACY_CAPTURE="$BUILD_DIR/tracy/iree-tracy-capture"
+            TRACY_OUT="${RESULT_PREFIX}.tracy"
+            S3_BASE="s3://eric-shark-test/${BENCH_NAME}-${CONFIG_HASH}"
+
+            export BENCHMARK_OUT="$RESULT_PREFIX.$BENCHMARK_OUT_FORMAT"
             mkdir -p "$IREE_DIR"/tmp/
 
             echo "[INFO] Running compile and benchmark for $BENCH_NAME"
             PATH="$BUILD_DIR/tools:$PATH" "$BENCHMARK_DIR/$BENCHMARK_PATH/$COMPILE_SCRIPT" "$HIP_TARGET_CHIP" "$TUNING_CHIP_CONFIG_MODE" "$BATCH_SIZE"
-            PATH="$BUILD_DIR/tools:$PATH" "$BENCHMARK_DIR/$BENCHMARK_PATH/$BENCHMARK_SCRIPT" "$HIP_DEVICE_ID" "$BATCH_SIZE"
+            echo "[INFO] Starting Tracy capture..."
+            "$TRACY_CAPTURE" -o "$TRACY_OUT" &
+            CAP_PID=$!
+            echo "[INFO] Tracy capture started (PID $CAP_PID), waiting for connection..."
+            TRACY_NO_EXIT=1 PATH="$BUILD_DIR/tools:$PATH" "$BENCHMARK_DIR/$BENCHMARK_PATH/$BENCHMARK_SCRIPT" "$HIP_DEVICE_ID" "$BATCH_SIZE"
 
-            echo "[INFO] Benchmark completed. Uploading results to S3"
-            aws s3 cp "$RESULT_FILE" "s3://eric-shark-test/$(basename "$RESULT_FILE")"
-            echo "[COMPLETED] Download results: aws s3 cp s3://eric-shark-test/$(basename "$RESULT_FILE") /local/path/to/results/"
+            echo "[INFO] Benchmark complete. Uploading results to ${S3_BASE}/ …"
+            aws s3 cp "$BENCHMARK_OUT" "${S3_BASE}/"
+            aws s3 cp "$TRACY_OUT"  "${S3_BASE}/"
+
+            echo "[COMPLETED] To fetch all results locally, run:"
+            echo "aws s3 cp --recursive ${S3_BASE}/ /local/path/to/results/"
         resources:
           limits:
             amd.com/gpu: 1
